@@ -30,6 +30,45 @@ struct SockAddrL2 {
 
 const AF_BLUETOOTH: i32 = 31;
 const BTPROTO_L2CAP: i32 = 0;
+const SOL_L2CAP: i32 = 6;
+const L2CAP_OPTIONS: i32 = 1;
+const SOL_BLUETOOTH: i32 = 274;
+const BT_SECURITY: i32 = 4;
+const BT_SECURITY_MEDIUM: u8 = 2;
+
+/// Linux `struct l2cap_options` from <bluetooth/l2cap.h>.
+#[repr(C)]
+struct L2capOptions {
+    omtu: u16,
+    imtu: u16,
+    flush_to: u16,
+    mode: u8,
+    fcs: u8,
+    max_tx: u8,
+    txwin_size: u16,
+}
+
+fn l2cap_options(fd: &OwnedFd) -> Result<L2capOptions, TransportError> {
+    // Safety: all fields are integers, and the buffer matches the Linux ABI.
+    let mut options: L2capOptions = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<L2capOptions>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            SOL_L2CAP,
+            L2CAP_OPTIONS,
+            &mut options as *mut L2capOptions as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret < 0 {
+        return Err(TransportError::with_source(
+            "failed to read L2CAP options",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(options)
+}
 
 /// Parse a Bluetooth MAC address string (e.g. "AA:BB:CC:DD:EE:FF") into 6 bytes.
 /// BlueZ stores addresses in little-endian order.
@@ -103,6 +142,46 @@ impl L2capLinux {
         // Safety: we just created this fd and checked it's valid (>= 0)
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
+        // Motion streaming requires an encrypted link, as in MousePods'
+        // l2cap.py. Linux struct bt_security is { u8 level; u8 key_size; }.
+        let security = [BT_SECURITY_MEDIUM, 0];
+        let ret = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                SOL_BLUETOOTH,
+                BT_SECURITY,
+                security.as_ptr() as *const libc::c_void,
+                security.len() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(TransportError::with_source(
+                "failed to require encrypted L2CAP link for motion streaming",
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        // Configure before connect so the receive MTU is advertised during
+        // L2CAP negotiation. Preserve the kernel's other socket options.
+        let mut options = l2cap_options(&fd)?;
+        options.imtu = packets::AAP_MTU;
+        options.omtu = packets::AAP_MTU;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                SOL_L2CAP,
+                L2CAP_OPTIONS,
+                &options as *const L2capOptions as *const libc::c_void,
+                std::mem::size_of::<L2capOptions>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(TransportError::with_source(
+                format!("failed to set L2CAP MTU to {} bytes", packets::AAP_MTU),
+                std::io::Error::last_os_error(),
+            ));
+        }
+
         // Build sockaddr_l2
         let addr = SockAddrL2 {
             l2_family: AF_BLUETOOTH as u16,
@@ -124,7 +203,12 @@ impl L2capLinux {
             ));
         }
 
-        log::info!("L2CAP connected to {address} PSM 0x{psm:04X}");
+        let options = l2cap_options(&fd)?;
+        log::info!(
+            "L2CAP connected to {address} PSM 0x{psm:04X}, receive MTU: {}, send MTU: {}",
+            options.imtu,
+            options.omtu,
+        );
 
         Ok(Self {
             fd,

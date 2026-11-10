@@ -25,6 +25,9 @@ pub const HEADER: [u8; 4] = [0x04, 0x00, 0x04, 0x00];
 /// L2CAP PSM used by AAP.
 pub const AAP_PSM: u16 = 0x1001;
 
+/// L2CAP MTU required for full-length AirPods IMU packets.
+pub const AAP_MTU: u16 = 2582;
+
 /// Bluetooth service UUID that identifies AirPods.
 pub const AIRPODS_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
 
@@ -156,18 +159,7 @@ pub fn build_adaptive_noise_level(level: u8) -> [u8; 11] {
     ControlCommand::create(0x2E, &[clamped, 0x00, 0x00, 0x00])
 }
 
-/// Check if raw data looks like a head tracking packet (size > 60, correct
-/// prefix, specific tag byte at offset 10).
+/// Recognize motion reports separately from sensor control responses.
 pub fn is_head_tracking_data(data: &[u8]) -> bool {
-    if data.len() <= 60 {
-        return false;
-    }
-    let prefix: [u8; 10] = [0x04, 0x00, 0x04, 0x00, 0x17, 0x00, 0x00, 0x00, 0x10, 0x00];
-    if data[..10] != prefix {
-        return false;
-    }
-    if data[10] != 0x44 && data[10] != 0x45 {
-        return false;
-    }
-    data[11] == 0x00
+    super::tracking::is_wx_motion(data)
 }

@@ -27,6 +27,9 @@ pub enum ParseError {
     #[error("packet too short ({0} bytes)")]
     TooShort(usize),
 
+    #[error("invalid sensor envelope length ({0} bytes)")]
+    SensorLength(usize),
+
     #[error("missing AAP header")]
     BadHeader,
 
@@ -194,10 +197,19 @@ pub fn parse(packet: &[u8]) -> Result<ParsedPacket, ParseError> {
         opcodes::DEVICE_METADATA => parse_metadata(packet),
 
         opcodes::HEADTRACKING => {
-            if packet.len() < 70 {
+            if packet.len() < 12 {
                 return Err(ParseError::TooShort(packet.len()));
             }
-            Ok(ParsedPacket::HeadTracking(packet.to_vec()))
+            if !super::tracking::valid_envelope(packet) {
+                return Err(ParseError::SensorLength(packet.len()));
+            }
+            // RTBuddy also carries short acknowledgements and device
+            // announcements; opcode 0x17 alone does not identify IMU data.
+            if packets::is_head_tracking_data(packet) {
+                Ok(ParsedPacket::HeadTracking(packet.to_vec()))
+            } else {
+                Ok(ParsedPacket::Unknown(packet.to_vec()))
+            }
         }
 
         opcodes::PROXIMITY_KEYS_RSP => parse_proximity_keys(packet),
@@ -494,12 +506,25 @@ mod tests {
 
     #[test]
     fn parse_head_tracking() {
-        let mut pkt = vec![0x04, 0x00, 0x04, 0x00, 0x17, 0x00];
-        pkt.resize(70, 0x00);
+        let mut pkt = super::super::tracking::WX_PREFIX.to_vec();
+        // Protobuf field 7: service 0x10, field 3: 58-byte motion block.
+        pkt.extend_from_slice(&[64, 0, 0x3a, 62, 8, 0x10, 0x1a, 58]);
+        pkt.resize(76, 0x00);
         match parse(&pkt).unwrap() {
-            ParsedPacket::HeadTracking(data) => assert_eq!(data.len(), 70),
+            ParsedPacket::HeadTracking(data) => assert_eq!(data.len(), 76),
             other => panic!("expected HeadTracking, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn short_sensor_control_is_not_truncated_imu() {
+        let pkt = super::super::tracking::stream(1, 0x10, 10_000);
+        assert_eq!(pkt.len(), 27);
+        assert!(matches!(parse(&pkt), Ok(ParsedPacket::Unknown(_))));
+        assert!(matches!(
+            parse(&pkt[..26]),
+            Err(ParseError::SensorLength(26))
+        ));
     }
 
     #[test]

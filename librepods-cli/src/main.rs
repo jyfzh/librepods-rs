@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 use librepods_core::device::ble_advert;
 use librepods_core::device::state::{model_from_number, DeviceState};
-use librepods_core::protocol::{packets, parser};
+use librepods_core::protocol::{packets, parser, tracking};
 use librepods_core::transport::{BleScanner, DeviceMonitor, L2capTransport, MediaControl};
 
 // ---------------------------------------------------------------------------
@@ -350,7 +350,7 @@ fn run_connection(
     transport.send(&packets::HANDSHAKE)?;
 
     // 2. Wait for handshake ACK, then send SET_SPECIFIC_FEATURES
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; packets::AAP_MTU as usize];
     let n = transport.recv(&mut buf)?;
     let pkt = &buf[..n];
     log::debug!("Received {} bytes: {:02X?}", n, pkt);
@@ -385,10 +385,19 @@ fn run_connection(
 
     log::info!("Handshake complete. Entering receive loop...");
 
-    // Start head-tracking sensor streaming. Best-effort: devices without
-    // spatial audio support simply ignore the packet.
-    if let Err(e) = transport.send(&packets::HEAD_TRACKING_START) {
+    // Prime activity before enabling devmotion6, then disable activity so
+    // only the motion stream remains active (SensorDataWX initialization).
+    let start_tracking = || -> Result<(), librepods_core::transport::TransportError> {
+        transport.send(&tracking::stream(1, 0x0e, 40_000))?;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        transport.send(&tracking::stream(2, 0x10, 10_000))?;
+        transport.send(&tracking::stream(3, 0x0e, 0))?;
+        Ok(())
+    };
+    if let Err(e) = start_tracking() {
         log::warn!("Failed to start head tracking (continuing): {e}");
+    } else {
+        log::info!("IMU stream requested: devmotion6 (0x10), interval 10000 µs");
     }
 
     let mut ear_mc = media.map(EarMediaController::new);
@@ -451,7 +460,8 @@ fn run_connection(
     }
 
     // Cleanup: stop head tracking (best-effort) and release the audio output.
-    let _ = transport.send(&packets::HEAD_TRACKING_STOP);
+    let _ = transport.send(&tracking::stream(4, 0x10, 0));
+    let _ = transport.send(&tracking::stream(5, 0x0e, 0));
     if let Some(emc) = ear_mc.as_ref() {
         emc.cleanup();
     }
@@ -521,8 +531,31 @@ fn apply_to_state(state: &mut DeviceState, packet: parser::ParsedPacket) {
             state.manufacturer = manufacturer;
         }
 
-        parser::ParsedPacket::HeadTracking(_) => {
-            // Too frequent to log
+        parser::ParsedPacket::HeadTracking(data) => {
+            if let Some(blocks) = tracking::wx_motion_blocks(&data) {
+                for block in blocks {
+                    if let Some(sample) = tracking::MotionSample::parse(block) {
+                        let [ax, ay, az] = sample.acceleration;
+                        let [gx, gy, gz] = sample.gravity;
+                        let [wx, wy, wz] = sample.angular_velocity;
+                        let attitude = match (sample.quaternion, sample.euler_degrees()) {
+                            (Some([w, x, y, z]), Some([roll, pitch, yaw])) => format!(
+                                "quat(wxyz)=[{w:+.4}, {x:+.4}, {y:+.4}, {z:+.4}] \
+                                rpy(deg)=[{roll:+.2}, {pitch:+.2}, {yaw:+.2}]"
+                            ),
+                            _ => "attitude=unavailable".to_string(),
+                        };
+                        log::info!(
+                            "IMU t={}ns #{} accel(m/s²)=[{ax:+.3}, {ay:+.3}, {az:+.3}] \
+                            gyro(deg/s)=[{wx:+.3}, {wy:+.3}, {wz:+.3}] \
+                            gravity(m/s²)=[{gx:+.3}, {gy:+.3}, {gz:+.3}] {attitude}",
+                            sample.timestamp_ns,
+                            sample.counter,
+                        );
+                    }
+                }
+            }
+            log::debug!("IMU raw AAP packet ({} bytes): {:02X?}", data.len(), data);
         }
 
         parser::ParsedPacket::ProximityKeys(keys) => {

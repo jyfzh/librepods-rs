@@ -18,7 +18,7 @@ This is a clean-room Rust rewrite inspired by [LibrePods](https://github.com/kav
 - **Rename**: Change your AirPods device name over AAP
 - **BLE Advertisement Decoding**: Scan for nearby AirPods without pairing. See model, battery, lid state
 - **Encrypted Battery**: AES-128 decryption of high-resolution battery data from BLE ads
-- **Head Tracking**: Receive raw spatial audio head tracking sensor data
+- **Head Tracking / IMU**: Stream user acceleration, angular velocity, gravity, quaternion, and Euler angles via SensorDataWX
 - **Device Metadata**: Read device name, model number, manufacturer
 - **Media Control**: Automatic A2DP activation, PipeWire (`wpctl`) / PulseAudio (`pactl`) backend detection
 - **Cross-Platform Core**: `librepods-core` is pure Rust with no OS dependencies, ready to be embedded in future platform targets
@@ -35,8 +35,8 @@ This is a clean-room Rust rewrite inspired by [LibrePods](https://github.com/kav
 | AirPods Max (Lightning) | ⚠️ Expected | Same protocol family, not yet verified |
 | AirPods Max (USB-C) | ⚠️ Expected | Same protocol family, not yet verified |
 | AirPods (4th gen, ANC) | ⚠️ Expected | Basic features should work |
-| AirPods (4th gen) | ⚠️ Expected | Basic features (battery, ear detection) |
-| AirPods (3rd gen) | ⚠️ Expected | Basic features (battery, ear detection) |
+| AirPods (4th gen) | ✅ Tested | Basic features (battery, ear detection) |
+| AirPods (3rd gen) | ⚠️ Unverified | Hardware validation pending |
 | AirPods (2nd gen) | ⚠️ Expected | Basic features (battery, ear detection) |
 | AirPods (1st gen) | ⚠️ Expected | Basic features (battery, ear detection) |
 
@@ -355,23 +355,36 @@ block-beta
   style k fill:#a3be8c,color:#2e3440
 ```
 
-### Handshake Sequence
+### Connection and IMU Streaming Sequence
 
-Connection to AirPods requires a strict three-step handshake:
+The Linux backend configures the L2CAP socket **before connecting**: it requires
+an encrypted link with `BT_SECURITY_MEDIUM` and sets both receive and send MTU to
+**2582 bytes** through `L2CAP_OPTIONS`. After connecting to PSM `0x1001`, it logs
+the actual negotiated MTUs. The CLI uses a 2582-byte receive buffer.
+
+The AAP handshake is followed by sensor initialization:
 
 ```mermaid
 sequenceDiagram
     participant C as Client (us)
     participant A as AirPods
 
+    Note over C: Linux: BT_SECURITY_MEDIUM, imtu/omtu = 2582
+    C->>A: Connect L2CAP PSM 0x1001
     C->>A: HANDSHAKE (00 00 04 00 …)
     A->>C: Handshake ACK (01 00 04 00 …)
     C->>A: SET_SPECIFIC_FEATURES (04 00 04 00 4D 00 …)
     A->>C: Features ACK (04 00 04 00 2B 00 …)
     C->>A: REQUEST_NOTIFICATIONS (04 00 04 00 0F 00 …)
 
+    C->>A: SensorDataWX: activity (0x0E), interval 40000 µs
+    Note over C: Wait 250 ms
+    C->>A: SensorDataWX: devmotion6 (0x10), interval 10000 µs
+    C->>A: SensorDataWX: activity (0x0E), interval 0 (stop)
+
     loop Receive Loop
-        A->>C: Battery / Ear / Noise / Metadata / …
+        A->>C: Battery / Ear / Noise / Metadata / Sensor reports
+        Note over C: Validate frame lengths, decode motion samples, log values
     end
 ```
 
@@ -507,6 +520,7 @@ RUST_LOG=debug ./target/debug/librepods-cli --address AA:BB:CC:DD:EE:FF
 This project is a Rust rewrite built upon the research and reverse engineering work of the [LibrePods](https://github.com/kavishdevar/librepods) project by [@kavishdevar](https://github.com/kavishdevar).
 
 Special thanks to:
+- [MousePods / @starman-tech](https://github.com/starman-tech/mousepods): encrypted L2CAP setup, sensor initialization, and IMU decoding
 - [@tyalie](https://github.com/tyalie): first public documentation of the AAP protocol ([AAP-Protocol-Definition](https://github.com/tyalie/AAP-Protocol-Defintion))
 - [@rithvikvibhu](https://github.com/rithvikvibhu) and the Lagrange Point community: hearing aid feature research
 - [@timgromeyer](https://github.com/timgromeyer): first version of the LibrePods Linux app
