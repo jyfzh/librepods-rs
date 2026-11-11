@@ -10,6 +10,8 @@ use clap::Parser;
 use librepods_core::protocol::{packets, parser, tracking};
 use librepods_core::transport::{DeviceEvent, DeviceMonitor, L2capTransport};
 
+mod opentrack;
+
 #[cfg(target_os = "linux")]
 mod platform {
     pub use librepods_linux::bluez_monitor::BluezMonitor as Monitor;
@@ -30,11 +32,48 @@ struct Cli {
     /// Maximum connection retry attempts.
     #[arg(long, default_value = "3")]
     retries: u32,
+
+    /// OpenTrack UDP destination IP:port (IPv6: [::1]:4242).
+    #[arg(long, default_value = "127.0.0.1:4242")]
+    opentrack: Option<std::net::SocketAddr>,
+
+    /// Maximum UDP packet rate; output follows incoming motion samples.
+    #[arg(long, default_value = "120", value_parser = clap::value_parser!(u16).range(1..=500))]
+    opentrack_rate: u16,
+
+    /// Yaw gain (negative values invert direction).
+    #[arg(long, default_value = "1", allow_hyphen_values = true, value_parser = finite_gain)]
+    yaw_scale: f64,
+    /// Pitch gain (negative values invert direction).
+    #[arg(long, default_value = "1", allow_hyphen_values = true, value_parser = finite_gain)]
+    pitch_scale: f64,
+    /// Roll gain (negative values invert direction).
+    #[arg(long, default_value = "1", allow_hyphen_values = true, value_parser = finite_gain)]
+    roll_scale: f64,
+}
+
+fn finite_gain(value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| "gain must be a finite number".to_string())
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
+    let mut output = cli.opentrack.map(|target| {
+        opentrack::Output::new(
+            target,
+            cli.opentrack_rate,
+            [cli.yaw_scale, cli.pitch_scale, cli.roll_scale],
+        )
+        .unwrap_or_else(|e| {
+            log::error!("Cannot initialize OpenTrack UDP: {e}");
+            std::process::exit(1);
+        })
+    });
 
     let address = if let Some(addr) = cli.address {
         log::info!("Using provided address: {addr}");
@@ -73,7 +112,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = run_connection(transport.as_ref()) {
+    if let Err(e) = run_connection(transport.as_ref(), &mut output) {
         log::error!("Connection ended: {e}");
         std::process::exit(1);
     }
@@ -96,7 +135,10 @@ fn connect_with_retries(address: &str, max_retries: u32) -> Option<Box<dyn L2cap
     None
 }
 
-fn run_connection(transport: &dyn L2capTransport) -> Result<(), Box<dyn std::error::Error>> {
+fn run_connection(
+    transport: &dyn L2capTransport,
+    output: &mut Option<opentrack::Output>,
+) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Sending handshake...");
     transport.send(&packets::HANDSHAKE)?;
 
@@ -130,7 +172,7 @@ fn run_connection(transport: &dyn L2capTransport) -> Result<(), Box<dyn std::err
                 break;
             }
             match parser::parse(&buf[..n]) {
-                Ok(parser::ParsedPacket::HeadTracking(data)) => log_motion(&data),
+                Ok(parser::ParsedPacket::HeadTracking(data)) => log_motion(&data, output),
                 Ok(_) => {}
                 Err(e) => log::warn!("Parse error: {e}"),
             }
@@ -144,10 +186,16 @@ fn run_connection(transport: &dyn L2capTransport) -> Result<(), Box<dyn std::err
     result
 }
 
-fn log_motion(data: &[u8]) {
+fn log_motion(data: &[u8], output: &mut Option<opentrack::Output>) {
     if let Some(blocks) = tracking::wx_motion_blocks(data) {
         for block in blocks {
             if let Some(sample) = tracking::MotionSample::parse(block) {
+                if let Some(output) = output {
+                    output.feed(&sample);
+                }
+                if !log::log_enabled!(log::Level::Debug) {
+                    continue;
+                }
                 let [ax, ay, az] = sample.acceleration;
                 let [gx, gy, gz] = sample.gravity;
                 let [wx, wy, wz] = sample.angular_velocity;
@@ -158,7 +206,7 @@ fn log_motion(data: &[u8]) {
                     ),
                     _ => "attitude=unavailable".to_string(),
                 };
-                log::info!(
+                log::debug!(
                     "IMU t={}ns #{} accel(m/s²)=[{ax:+.3}, {ay:+.3}, {az:+.3}] \
                     gyro(deg/s)=[{wx:+.3}, {wy:+.3}, {wz:+.3}] \
                     gravity(m/s²)=[{gx:+.3}, {gy:+.3}, {gz:+.3}] {attitude}",

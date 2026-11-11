@@ -3,14 +3,12 @@
 A Rust tool for streaming AirPods IMU data on Linux over the Apple Accessory
 Protocol (AAP). No Apple device is needed.
 
-The CLI connects over Bluetooth L2CAP and outputs user acceleration, angular
-velocity, gravity, quaternion, and Euler angles. It supports an explicit
-Bluetooth address or automatic detection through BlueZ, with connection retries.
-Battery, ear detection, and other notifications are ignored by the CLI.
+Streams head tracking to OpenTrack over UDP, with automatic device detection
+through BlueZ. IMU support depends on the AirPods model and firmware.
 
 ## Build
 
-Install Rust and the Linux build dependencies:
+Install Rust, then build on Debian/Ubuntu:
 
 ```bash
 sudo apt update
@@ -22,6 +20,10 @@ cargo build --release -p librepods-cli
 ## Pair and run
 
 Pair the AirPods using `bluetoothctl`:
+
+```bash
+bluetoothctl
+```
 
 ```text
 scan on
@@ -36,44 +38,45 @@ Bluetooth sockets require capabilities:
 ```bash
 sudo setcap cap_net_raw,cap_net_admin+eip ./target/release/librepods-cli
 
-# Auto-detect connected AirPods
+# Auto-detect connected AirPods and stream to OpenTrack
 RUST_LOG=info ./target/release/librepods-cli
 
 # Or specify the paired Bluetooth address
 RUST_LOG=info ./target/release/librepods-cli --address AA:BB:CC:DD:EE:FF
 ```
 
-Reapply capabilities after rebuilding the binary. Alternatively, run the binary
-with `sudo`. IMU availability depends on the AirPods model and firmware.
+Reapply capabilities after rebuilding, or run with `sudo`. Use `RUST_LOG=debug`
+to log IMU samples and raw packets, and `--help` for all CLI options.
 
-## CLI options
+## OpenTrack UDP output
 
-```text
-Usage: librepods-cli [OPTIONS]
+Select **UDP over network** as the input in OpenTrack, listening on port `4242`.
+The CLI sends to `127.0.0.1:4242` by default. Face forward when starting;
+restart the CLI to recenter.
 
-Options:
-  -a, --address <ADDRESS>  Bluetooth address; otherwise auto-detect via BlueZ
-      --retries <RETRIES>  Maximum connection retry attempts [default: 3]
-  -h, --help               Print help
+```bash
+# OpenTrack on another machine; adjust axis sensitivity/direction
+./target/release/librepods-cli --opentrack 192.168.1.100:4242 \
+  --opentrack-rate 100 --yaw-scale -1 --pitch-scale 1.5 --roll-scale 1
 ```
 
-Use `RUST_LOG=debug` to include raw IMU packet logging.
+For remote output, allow UDP traffic on the receiving machine.
+IPv6 addresses use brackets, e.g. `--opentrack '[::1]:4242'`.
 
-## IMU initialization
+| Option | Default | Meaning |
+|---|---|---|
+| `--opentrack IP:PORT` | `127.0.0.1:4242` | Destination IPv4 or IPv6 address and nonzero port |
+| `--opentrack-rate HZ` | `120` | Maximum send rate, from 1 to 500 Hz |
+| `--yaw-scale N` | `1` | Yaw gain; negative values invert direction |
+| `--pitch-scale N` | `1` | Pitch gain; negative values invert direction |
+| `--roll-scale N` | `1` | Roll gain; negative values invert direction |
+| `--retries N` | `3` | Maximum connection retry attempts |
 
-The Linux backend requires an encrypted L2CAP link (`BT_SECURITY_MEDIUM`) and
-configures receive/send MTU to 2582 bytes before connecting to PSM `0x1001`.
-After the AAP handshake, feature setup, and notification request, the CLI:
-
-1. Starts SensorDataWX activity (`0x0E`) with a 40000 µs interval.
-2. Waits 250 ms.
-3. Starts devmotion6 (`0x10`) with a 10000 µs interval.
-4. Stops the activity stream.
-5. Decodes motion samples and logs timestamps, counters, acceleration in m/s²,
-   angular velocity in degrees/s, gravity in m/s², and available attitude data.
-
-When the receive loop ends or sensor initialization fails, the CLI attempts to
-stop both streams. Abrupt process termination cannot perform this cleanup.
+Output uses the MousePods UDP format: six little-endian `f64` values
+(`x, y, z, yaw, pitch, roll`), with zero translation and rotation in degrees.
+Poses require valid quaternion data and follow incoming samples (approximately
+100 Hz), capped by `--opentrack-rate`. Adjust axis gains in the CLI or OpenTrack;
+calibrated head-axis mapping and filtering are not included.
 
 ## Architecture and testing
 
@@ -83,7 +86,6 @@ stop both streams. Abrupt process termination cannot perform this cleanup.
 | `librepods-linux` | L2CAP transport, BlueZ monitoring, and BLE library APIs |
 | `librepods-cli` | Connection setup, IMU initialization, and motion output |
 
-The core library retains general protocol support for use by library consumers.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the module layout.
 
 ```bash
