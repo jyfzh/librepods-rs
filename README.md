@@ -54,11 +54,6 @@ The AAP protocol is consistent across all AirPods models (based on analysis of t
 │                         BLE scan (btleplug),             │
 │                         Media (wpctl / pactl / playerctl)│
 ├──────────────────────────────────────────────────────────┤
-│  librepods-windows      L2CAP (WinSock AF_BTH),          │
-│                         WinRT Bluetooth monitor,         │
-│                         BLE scan (btleplug),             │
-│                         Media (SMTC via WinRT)           │
-├──────────────────────────────────────────────────────────┤
 │  librepods-core         AAP parser, packet builder,      │
 │                         device state, BLE ad decoder,    │
 │                         transport traits                 │
@@ -70,7 +65,6 @@ The AAP protocol is consistent across all AirPods models (based on analysis of t
 |---|---|---|
 | `librepods-core` | `serde`, `thiserror`, `log`, `aes` | Protocol engine, device state, BLE parsing |
 | `librepods-linux` | `nix`, `zbus`, `btleplug`, `tokio`, `libc` | Linux Bluetooth + media I/O |
-| `librepods-windows` | `btleplug`, `tokio`, `windows`, `windows-sys` | Windows Bluetooth + media I/O |
 | `librepods-cli` | `clap`, `env_logger`, `tokio` | Headless daemon |
 
 ## Prerequisites (Ubuntu / Debian)
@@ -134,55 +128,6 @@ sudo apt install -y build-essential pkg-config libdbus-1-dev libudev-dev \
     bluetooth bluez wireplumber playerctl \
   && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
-
-## Windows Support
-
-Windows is supported through the `librepods-windows` crate, which implements the
-same transport traits as the Linux backend:
-
-| Concern | Windows implementation |
-|---|---|
-| L2CAP | WinSock Bluetooth sockets (`AF_BTH` + `BTHPROTO_L2CAP`) |
-| Device monitor | WinRT `Windows.Devices.Bluetooth` polling |
-| BLE scan | `btleplug` (WinRT backend) |
-| Media | SMTC `Windows.Media.Control` for play/pause |
-
-`librepods-core` is platform-independent and shared by both backends. The CLI
-selects the backend at compile time (see the `platform` module in
-`librepods-cli/src/main.rs`).
-
-### Requirements
-
-- Windows 10 (1809+) or Windows 11, with a working Bluetooth adapter
-- The Rust toolchain (MSVC) — `winget install Rustlang.Rustup` or <https://rustup.rs>
-- AirPods **paired** to Windows first (Settings → Bluetooth & devices)
-
-### Build & run
-
-PowerShell:
-
-```powershell
-cargo build --release -p librepods-cli
-
-# Scan for nearby AirPods (no pairing needed)
-.\target\release\librepods-cli.exe --scan
-
-# Connect to paired AirPods (auto-detect, or pass the address directly)
-$env:RUST_LOG="info"; .\target\release\librepods-cli.exe
-.\target\release\librepods-cli.exe --address AA:BB:CC:DD:EE:FF
-```
-
-Unlike Linux, no `CAP_NET_RAW` / `setcap` step is required. If Bluetooth policy
-restricts socket access, try running the terminal as Administrator.
-
-### Windows notes
-
-- AirPods are auto-detected by device name containing `"AirPods"`; pass
-  `--address` if you renamed them.
-- Media play/pause uses the active SMTC media session. Volume control and manual
-  audio routing are not implemented yet (Windows routes A2DP automatically).
-- The `librepods-linux` crate compiles to an empty library on Windows, so a
-  workspace-wide `cargo build` succeeds on both platforms.
 
 ## Quick Start
 

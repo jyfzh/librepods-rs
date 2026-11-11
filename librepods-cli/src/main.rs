@@ -35,16 +35,8 @@ mod platform {
     pub use librepods_linux::media::LinuxMediaControl as Media;
 }
 
-#[cfg(target_os = "windows")]
-mod platform {
-    pub use librepods_windows::ble::BtleplugScanner as Scanner;
-    pub use librepods_windows::device_monitor::WindowsDeviceMonitor as Monitor;
-    pub use librepods_windows::l2cap::L2capWindows as Transport;
-    pub use librepods_windows::media::WindowsMediaControl as Media;
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-compile_error!("librepods-cli currently supports only Linux and Windows targets");
+#[cfg(not(target_os = "linux"))]
+compile_error!("librepods-cli currently supports only Linux targets");
 
 #[derive(Parser)]
 #[command(name = "librepods", about = "LibrePods CLI daemon")]

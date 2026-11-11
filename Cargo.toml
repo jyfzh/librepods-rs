@@ -2,7 +2,6 @@
 members = [
     "librepods-core",
     "librepods-linux",
-    "librepods-windows",
     "librepods-cli",
 ]
 resolver = "2"
@@ -11,4 +10,3 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
-

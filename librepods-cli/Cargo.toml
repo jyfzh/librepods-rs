@@ -3,7 +3,7 @@ name = "librepods-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI daemon for LibrePods — testing and headless operation on Linux and Windows"
+description = "CLI daemon for LibrePods — testing and headless operation on Linux"
 
 [dependencies]
 librepods-core = { path = "../librepods-core" }
@@ -15,6 +15,3 @@ clap = { version = "4", features = ["derive"] }
 # The concrete platform implementation is selected at compile time.
 [target.'cfg(target_os = "linux")'.dependencies]
 librepods-linux = { path = "../librepods-linux" }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-librepods-windows = { path = "../librepods-windows" }

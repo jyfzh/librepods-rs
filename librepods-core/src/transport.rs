@@ -112,7 +112,6 @@ pub trait DeviceMonitor: Send + Sync {
 ///
 /// Implemented by:
 /// - `librepods-linux`: MPRIS D-Bus interface + PulseAudio/PipeWire
-/// - `librepods-windows`: SMTC (WinRT) for playback + Win32 for routing checks
 pub trait MediaControl: Send + Sync {
     /// Set the Bluetooth address of the connected AirPods (colon-separated).
     ///

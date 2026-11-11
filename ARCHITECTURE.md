@@ -28,13 +28,6 @@ librepods-linux/src/
 ├── ble.rs                    # BLE scanning via btleplug
 └── media.rs                  # wpctl / pactl + playerctl / MPRIS
 
-librepods-windows/src/
-├── lib.rs                    # #![cfg(target_os = "windows")]
-├── l2cap.rs                  # WinSock AF_BTH L2CAP socket
-├── device_monitor.rs         # WinRT Bluetooth connection events
-├── ble.rs                    # BLE scanning via btleplug (WinRT backend)
-└── media.rs                  # SMTC (WinRT) playback + default-render check
-
 librepods-cli/src/
 └── main.rs                   # CLI, handshake state machine, receive loop, `platform` module
 ```

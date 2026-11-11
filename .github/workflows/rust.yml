@@ -11,18 +11,12 @@ env:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
 
     - name: Install system dependencies (Linux)
-      if: runner.os == 'Linux'
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -46,7 +40,6 @@ jobs:
       run: cargo test --verbose
 
     - name: Check core for Android (crate-purity litmus test)
-      if: runner.os == 'Linux'
       run: |
         rustup target add aarch64-linux-android
         cargo check -p librepods-core --target aarch64-linux-android
