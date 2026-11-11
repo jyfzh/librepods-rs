@@ -732,7 +732,6 @@ dependencies = [
  "librepods-core",
  "librepods-linux",
  "log",
- "tokio",
 ]
 
 [[package]]

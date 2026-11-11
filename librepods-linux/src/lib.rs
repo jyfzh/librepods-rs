@@ -12,4 +12,3 @@
 pub mod ble;
 pub mod bluez_monitor;
 pub mod l2cap;
-pub mod media;

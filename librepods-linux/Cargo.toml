@@ -3,7 +3,7 @@ name = "librepods-linux"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Linux platform implementations for LibrePods (BlueZ, MPRIS, L2CAP)"
+description = "Linux platform implementations for LibrePods (BlueZ, L2CAP)"
 
 [dependencies]
 librepods-core = { path = "../librepods-core" }

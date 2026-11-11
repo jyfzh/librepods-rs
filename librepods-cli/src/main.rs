@@ -2,44 +2,25 @@
 // Copyright (C) 2025 LibrePods contributors
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! CLI daemon for LibrePods.
-//!
-//! Wires the core library and Linux platform implementations together into a
-//! headless daemon that:
-//! 1. Watches for AirPods connection via BlueZ D-Bus
-//! 2. Connects via L2CAP, performs handshake
-//! 3. Parses incoming packets and logs device state
-//! 4. Optionally controls media via MPRIS on ear detection events
+//! Connect to AirPods over L2CAP and stream IMU motion samples.
 
 use std::time::Duration;
 
 use clap::Parser;
-use librepods_core::device::ble_advert;
-use librepods_core::device::state::{model_from_number, DeviceState};
 use librepods_core::protocol::{packets, parser, tracking};
-use librepods_core::transport::{BleScanner, DeviceMonitor, L2capTransport, MediaControl};
-
-// ---------------------------------------------------------------------------
-// Platform selection
-//
-// The CLI only depends on the `librepods-core` traits; the concrete platform
-// implementation is selected here at compile time via Cargo target-specific
-// dependencies.
-// ---------------------------------------------------------------------------
+use librepods_core::transport::{DeviceEvent, DeviceMonitor, L2capTransport};
 
 #[cfg(target_os = "linux")]
 mod platform {
-    pub use librepods_linux::ble::BtleplugScanner as Scanner;
     pub use librepods_linux::bluez_monitor::BluezMonitor as Monitor;
     pub use librepods_linux::l2cap::L2capLinux as Transport;
-    pub use librepods_linux::media::LinuxMediaControl as Media;
 }
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("librepods-cli currently supports only Linux targets");
 
 #[derive(Parser)]
-#[command(name = "librepods", about = "LibrePods CLI daemon")]
+#[command(name = "librepods", about = "AirPods IMU streaming daemon")]
 struct Cli {
     /// Bluetooth address to connect to directly (e.g. "AA:BB:CC:DD:EE:FF").
     /// If not given, will auto-detect via BlueZ.
@@ -49,46 +30,31 @@ struct Cli {
     /// Maximum connection retry attempts.
     #[arg(long, default_value = "3")]
     retries: u32,
-
-    /// Scan for nearby AirPods via BLE advertisements without connecting.
-    /// Useful for finding AirPods that haven't been paired yet.
-    #[arg(short, long)]
-    scan: bool,
-
-    /// Disable media control (no auto play/pause, no A2DP activation).
-    #[arg(long)]
-    no_media: bool,
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
 
-    if cli.scan {
-        run_ble_scan();
-        return;
-    }
-
     let address = if let Some(addr) = cli.address {
         log::info!("Using provided address: {addr}");
         addr
     } else {
         log::info!("Watching for AirPods...");
-        let monitor: Box<dyn DeviceMonitor> = match platform::Monitor::start() {
-            Ok(m) => Box::new(m),
+        let monitor = match platform::Monitor::start() {
+            Ok(m) => m,
             Err(e) => {
                 log::error!("Failed to start device monitor: {e}");
                 std::process::exit(1);
             }
         };
-
         loop {
             match monitor.next_event() {
-                Ok(librepods_core::transport::DeviceEvent::Connected { address, name }) => {
+                Ok(DeviceEvent::Connected { address, name }) => {
                     log::info!("AirPods detected: {name} ({address})");
                     break address;
                 }
-                Ok(librepods_core::transport::DeviceEvent::Disconnected { address }) => {
+                Ok(DeviceEvent::Disconnected { address }) => {
                     log::info!("Device disconnected: {address}");
                 }
                 Err(e) => {
@@ -99,9 +65,7 @@ fn main() {
         }
     };
 
-    // Connect with retries
-    let transport = connect_with_retries(&address, cli.retries);
-    let transport = match transport {
+    let transport = match connect_with_retries(&address, cli.retries) {
         Some(t) => t,
         None => {
             log::error!("Failed to connect after {} attempts", cli.retries);
@@ -109,125 +73,11 @@ fn main() {
         }
     };
 
-    // Run the handshake state machine
-    let mut state = DeviceState {
-        bluetooth_address: address.clone(),
-        ..DeviceState::default()
-    };
-
-    let media: Option<Box<dyn MediaControl>> = if cli.no_media {
-        log::info!("Media control disabled (--no-media)");
-        None
-    } else {
-        let mut mc = platform::Media::new();
-        mc.set_device_address(&address);
-        Some(Box::new(mc))
-    };
-
-    if let Err(e) = run_connection(transport.as_ref(), &mut state, media.as_deref()) {
+    if let Err(e) = run_connection(transport.as_ref()) {
         log::error!("Connection ended: {e}");
+        std::process::exit(1);
     }
-
-    log::info!("Disconnected. Final state: {state:#?}");
-}
-
-/// BLE scan mode: discover nearby AirPods via BLE advertisements and print their info.
-fn run_ble_scan() {
-    log::info!("Scanning for nearby AirPods via BLE...");
-    log::info!("Open the AirPods case lid to make them discoverable. Press Ctrl+C to stop.\n");
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime");
-
-    let scanner: Box<dyn BleScanner> = match rt.block_on(platform::Scanner::start()) {
-        Ok(s) => Box::new(s),
-        Err(e) => {
-            log::error!("Failed to start BLE scanner: {e}");
-            log::error!("Make sure Bluetooth is enabled and you have permission to scan.");
-            log::error!("On Linux, you may need to run: sudo setcap cap_net_raw+eip <binary>");
-            std::process::exit(1);
-        }
-    };
-
-    // Track seen addresses to avoid repeating the same AirPods
-    let mut seen = std::collections::HashSet::new();
-
-    loop {
-        match scanner.next_advertisement() {
-            Ok(advert) => {
-                if let Some(parsed) = ble_advert::parse_advertisement(&advert.manufacturer_data) {
-                    let key = (advert.address.clone(), parsed.model_id);
-                    let is_new = seen.insert(key);
-
-                    if is_new {
-                        let rssi_str = advert
-                            .rssi
-                            .map(|r| format!("{r} dBm"))
-                            .unwrap_or_else(|| "unknown".to_string());
-
-                        println!("┌─────────────────────────────────────────────");
-                        println!("│ 🎧 AirPods found!");
-                        println!("│ Model:       {:?}", parsed.model);
-                        println!(
-                            "│ BLE address: {} (random — NOT the pairing address)",
-                            advert.address
-                        );
-                        println!("│ RSSI:        {rssi_str}");
-                        println!(
-                            "│ Paired:      {}",
-                            if parsed.paired {
-                                "yes (to another device)"
-                            } else {
-                                "no"
-                            }
-                        );
-
-                        if let Some(l) = parsed.left_battery {
-                            println!(
-                                "│ Left:        {l}%{}",
-                                if parsed.left_charging { " ⚡" } else { "" }
-                            );
-                        }
-                        if let Some(r) = parsed.right_battery {
-                            println!(
-                                "│ Right:       {r}%{}",
-                                if parsed.right_charging { " ⚡" } else { "" }
-                            );
-                        }
-                        if let Some(c) = parsed.case_battery {
-                            println!(
-                                "│ Case:        {c}%{}",
-                                if parsed.case_charging { " ⚡" } else { "" }
-                            );
-                        }
-                        println!("│ Lid:         {:?}", parsed.lid_state);
-                        println!("│ Connection:  {:?}", parsed.connection_state);
-                        println!("├─────────────────────────────────────────────");
-                        println!(
-                            "│ ⚠ BLE address is random and changes. To pair, use bluetoothctl:"
-                        );
-                        println!("│");
-                        println!("│   1. Hold the case button until LED flashes white");
-                        println!("│   2. bluetoothctl");
-                        println!("│   3. scan on");
-                        println!("│   4. Look for your AirPods name and note the address");
-                        println!("│   5. pair <address>");
-                        println!("│   6. trust <address>");
-                        println!("│   7. connect <address>");
-                        println!("│");
-                        println!("│ After pairing, run: librepods-cli (without --scan)");
-                        println!("└─────────────────────────────────────────────\n");
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("BLE scan error: {e}");
-                break;
-            }
-        }
-    }
+    log::info!("Disconnected.");
 }
 
 fn connect_with_retries(address: &str, max_retries: u32) -> Option<Box<dyn L2capTransport>> {
@@ -246,357 +96,77 @@ fn connect_with_retries(address: &str, max_retries: u32) -> Option<Box<dyn L2cap
     None
 }
 
-// ---------------------------------------------------------------------------
-// Ear-detection → media control helper
-// ---------------------------------------------------------------------------
-
-/// Manages automatic A2DP activation and play/pause based on ear detection.
-///
-/// Keeps internal state about whether audio has been activated and whether
-/// we auto-paused so we can resume when a pod goes back in ear.
-struct EarMediaController<'a> {
-    media: &'a dyn MediaControl,
-    audio_activated: bool,
-    paused_by_us: bool,
-}
-
-impl<'a> EarMediaController<'a> {
-    fn new(media: &'a dyn MediaControl) -> Self {
-        Self {
-            media,
-            audio_activated: false,
-            paused_by_us: false,
-        }
-    }
-
-    /// Try to activate A2DP audio output (idempotent after first success).
-    fn try_activate(&mut self) {
-        if self.audio_activated {
-            return;
-        }
-        log::info!("Activating A2DP audio output for AirPods...");
-        match self.media.activate_audio() {
-            Ok(()) => {
-                self.audio_activated = true;
-                log::info!("🔊 Audio routed to AirPods — you can listen now!");
-            }
-            Err(e) => {
-                log::warn!("Failed to activate audio: {e}");
-                log::warn!("You may need to manually set AirPods as audio output.");
-            }
-        }
-    }
-
-    /// Called when metadata is first received — activate if pods are in ear.
-    fn on_metadata(&mut self, state: &DeviceState) {
-        if state.any_pod_in_ear() {
-            self.try_activate();
-        } else {
-            log::info!("AirPods not in ear yet — will activate audio when worn");
-        }
-    }
-
-    /// Called on ear detection changes — activate, resume, or pause.
-    fn on_ear_detection(&mut self, primary_in_ear: bool, secondary_in_ear: bool) {
-        if primary_in_ear || secondary_in_ear {
-            // At least one pod in ear
-            self.try_activate();
-            if self.paused_by_us && self.media.is_airpods_active_sink() {
-                log::info!("▶ Resuming playback (pod back in ear)");
-                let _ = self.media.play();
-                self.paused_by_us = false;
-            }
-        } else {
-            // Both pods out of ear
-            if self.audio_activated && self.media.is_airpods_active_sink() {
-                log::info!("⏸ Pausing playback (both pods removed)");
-                if self.media.pause().is_ok() {
-                    self.paused_by_us = true;
-                }
-            }
-        }
-    }
-
-    /// Cleanup on disconnect — remove AirPods audio output.
-    fn cleanup(&self) {
-        if self.audio_activated {
-            log::info!("Removing AirPods audio output...");
-            let _ = self.media.remove_audio_output();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Connection state machine
-// ---------------------------------------------------------------------------
-
-fn run_connection(
-    transport: &dyn L2capTransport,
-    state: &mut DeviceState,
-    media: Option<&dyn MediaControl>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // --- Handshake sequence ---
-
-    // 1. Send handshake
+fn run_connection(transport: &dyn L2capTransport) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Sending handshake...");
     transport.send(&packets::HANDSHAKE)?;
 
-    // 2. Wait for handshake ACK, then send SET_SPECIFIC_FEATURES
     let mut buf = [0u8; packets::AAP_MTU as usize];
     let n = transport.recv(&mut buf)?;
-    let pkt = &buf[..n];
-    log::debug!("Received {} bytes: {:02X?}", n, pkt);
-
-    match parser::parse(pkt)? {
-        parser::ParsedPacket::HandshakeAck => {
-            log::info!("Handshake ACK received, sending SET_SPECIFIC_FEATURES");
-            transport.send(&packets::SET_SPECIFIC_FEATURES)?;
-        }
-        other => {
-            log::warn!("Expected HandshakeAck, got: {other:?}");
-            // Try sending features anyway
-            transport.send(&packets::SET_SPECIFIC_FEATURES)?;
-        }
+    match parser::parse(&buf[..n])? {
+        parser::ParsedPacket::HandshakeAck => log::info!("Handshake ACK received"),
+        other => log::warn!("Expected HandshakeAck, got: {other:?}"),
     }
+    transport.send(&packets::SET_SPECIFIC_FEATURES)?;
 
-    // 3. Wait for features ACK, then send REQUEST_NOTIFICATIONS
     let n = transport.recv(&mut buf)?;
-    let pkt = &buf[..n];
-    log::debug!("Received {} bytes: {:02X?}", n, pkt);
-
-    match parser::parse(pkt)? {
-        parser::ParsedPacket::FeaturesAck => {
-            log::info!("Features ACK received, sending REQUEST_NOTIFICATIONS");
-            transport.send(&packets::REQUEST_NOTIFICATIONS)?;
-        }
-        other => {
-            log::warn!("Expected FeaturesAck, got: {other:?}");
-            transport.send(&packets::REQUEST_NOTIFICATIONS)?;
-        }
+    match parser::parse(&buf[..n])? {
+        parser::ParsedPacket::FeaturesAck => log::info!("Features ACK received"),
+        other => log::warn!("Expected FeaturesAck, got: {other:?}"),
     }
-
-    log::info!("Handshake complete. Entering receive loop...");
+    transport.send(&packets::REQUEST_NOTIFICATIONS)?;
 
     // Prime activity before enabling devmotion6, then disable activity so
     // only the motion stream remains active (SensorDataWX initialization).
-    let start_tracking = || -> Result<(), librepods_core::transport::TransportError> {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         transport.send(&tracking::stream(1, 0x0e, 40_000))?;
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(250));
         transport.send(&tracking::stream(2, 0x10, 10_000))?;
         transport.send(&tracking::stream(3, 0x0e, 0))?;
-        Ok(())
-    };
-    if let Err(e) = start_tracking() {
-        log::warn!("Failed to start head tracking (continuing): {e}");
-    } else {
         log::info!("IMU stream requested: devmotion6 (0x10), interval 10000 µs");
-    }
 
-    let mut ear_mc = media.map(EarMediaController::new);
-
-    // --- Main receive loop ---
-    loop {
-        let n = match transport.recv(&mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                log::error!("Receive error: {e}");
+        loop {
+            let n = transport.recv(&mut buf)?;
+            if n == 0 {
                 break;
             }
-        };
-
-        let pkt = &buf[..n];
-
-        // Skip logging head tracking data (very frequent)
-        if !packets::is_head_tracking_data(pkt) {
-            log::debug!(
-                "Received {} bytes: {}",
-                n,
-                pkt.iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
-
-        match parser::parse(pkt) {
-            Ok(parsed) => {
-                let is_first_metadata = matches!(&parsed, parser::ParsedPacket::Metadata { .. })
-                    && ear_mc.as_ref().is_some_and(|emc| !emc.audio_activated);
-
-                let ear_event = match &parsed {
-                    parser::ParsedPacket::EarDetection {
-                        primary_in_ear,
-                        secondary_in_ear,
-                    } => Some((*primary_in_ear, *secondary_in_ear)),
-                    _ => None,
-                };
-
-                apply_to_state(state, parsed);
-
-                if is_first_metadata {
-                    if let Some(emc) = ear_mc.as_mut() {
-                        emc.on_metadata(state);
-                    }
-                }
-
-                if let Some((primary, secondary)) = ear_event {
-                    if let Some(emc) = ear_mc.as_mut() {
-                        emc.on_ear_detection(primary, secondary);
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("Parse error: {e}");
+            match parser::parse(&buf[..n]) {
+                Ok(parser::ParsedPacket::HeadTracking(data)) => log_motion(&data),
+                Ok(_) => {}
+                Err(e) => log::warn!("Parse error: {e}"),
             }
         }
-    }
+        Ok(())
+    })();
 
-    // Cleanup: stop head tracking (best-effort) and release the audio output.
+    // Stop both streams even if initialization or reception failed.
     let _ = transport.send(&tracking::stream(4, 0x10, 0));
     let _ = transport.send(&tracking::stream(5, 0x0e, 0));
-    if let Some(emc) = ear_mc.as_ref() {
-        emc.cleanup();
-    }
-
-    Ok(())
+    result
 }
 
-fn apply_to_state(state: &mut DeviceState, packet: parser::ParsedPacket) {
-    match packet {
-        parser::ParsedPacket::Battery(info) => {
-            log::info!(
-                "Battery — L:{}% R:{}% Case:{}%",
-                info.left.level,
-                info.right.level,
-                info.case_.level,
-            );
-            state.battery = info;
-        }
-
-        parser::ParsedPacket::EarDetection {
-            primary_in_ear,
-            secondary_in_ear,
-        } => {
-            log::info!(
-                "Ear detection — primary:{} secondary:{}",
-                if primary_in_ear { "in" } else { "out" },
-                if secondary_in_ear { "in" } else { "out" },
-            );
-            state.primary_in_ear = primary_in_ear;
-            state.secondary_in_ear = secondary_in_ear;
-        }
-
-        parser::ParsedPacket::NoiseControl(mode) => {
-            log::info!("Noise control mode: {mode:?}");
-            state.noise_control = mode;
-        }
-
-        parser::ParsedPacket::ConversationalAwareness { status } => {
-            log::info!("Conversational awareness status: 0x{status:02X}");
-        }
-
-        parser::ParsedPacket::ControlCommand { id, data } => {
-            log::info!("Control command: {id:?} data={data:02X?}");
-
-            // Update specific state fields based on the command
-            use librepods_core::protocol::control_command::ControlCommandId;
-            match id {
-                ControlCommandId::ConversationDetectConfig => {
-                    state.conversational_awareness = data[0] == 0x01;
-                }
-                ControlCommandId::OneBudAncMode => {
-                    state.one_bud_anc = data[0] == 0x01;
-                }
-                _ => {}
-            }
-        }
-
-        parser::ParsedPacket::Metadata {
-            name,
-            model_number,
-            manufacturer,
-        } => {
-            log::info!("Metadata — name:{name} model:{model_number} mfr:{manufacturer}");
-            state.device_name = name;
-            state.model = model_from_number(&model_number);
-            state.model_number = model_number;
-            state.manufacturer = manufacturer;
-        }
-
-        parser::ParsedPacket::HeadTracking(data) => {
-            if let Some(blocks) = tracking::wx_motion_blocks(&data) {
-                for block in blocks {
-                    if let Some(sample) = tracking::MotionSample::parse(block) {
-                        let [ax, ay, az] = sample.acceleration;
-                        let [gx, gy, gz] = sample.gravity;
-                        let [wx, wy, wz] = sample.angular_velocity;
-                        let attitude = match (sample.quaternion, sample.euler_degrees()) {
-                            (Some([w, x, y, z]), Some([roll, pitch, yaw])) => format!(
-                                "quat(wxyz)=[{w:+.4}, {x:+.4}, {y:+.4}, {z:+.4}] \
-                                rpy(deg)=[{roll:+.2}, {pitch:+.2}, {yaw:+.2}]"
-                            ),
-                            _ => "attitude=unavailable".to_string(),
-                        };
-                        log::info!(
-                            "IMU t={}ns #{} accel(m/s²)=[{ax:+.3}, {ay:+.3}, {az:+.3}] \
-                            gyro(deg/s)=[{wx:+.3}, {wy:+.3}, {wz:+.3}] \
-                            gravity(m/s²)=[{gx:+.3}, {gy:+.3}, {gz:+.3}] {attitude}",
-                            sample.timestamp_ns,
-                            sample.counter,
-                        );
-                    }
-                }
-            }
-            log::debug!("IMU raw AAP packet ({} bytes): {:02X?}", data.len(), data);
-        }
-
-        parser::ParsedPacket::ProximityKeys(keys) => {
-            for key in &keys {
+fn log_motion(data: &[u8]) {
+    if let Some(blocks) = tracking::wx_motion_blocks(data) {
+        for block in blocks {
+            if let Some(sample) = tracking::MotionSample::parse(block) {
+                let [ax, ay, az] = sample.acceleration;
+                let [gx, gy, gz] = sample.gravity;
+                let [wx, wy, wz] = sample.angular_velocity;
+                let attitude = match (sample.quaternion, sample.euler_degrees()) {
+                    (Some([w, x, y, z]), Some([roll, pitch, yaw])) => format!(
+                        "quat(wxyz)=[{w:+.4}, {x:+.4}, {y:+.4}, {z:+.4}] \
+                        rpy(deg)=[{roll:+.2}, {pitch:+.2}, {yaw:+.2}]"
+                    ),
+                    _ => "attitude=unavailable".to_string(),
+                };
                 log::info!(
-                    "Proximity key: {:?} ({} bytes)",
-                    key.key_type,
-                    key.data.len()
+                    "IMU t={}ns #{} accel(m/s²)=[{ax:+.3}, {ay:+.3}, {az:+.3}] \
+                    gyro(deg/s)=[{wx:+.3}, {wy:+.3}, {wz:+.3}] \
+                    gravity(m/s²)=[{gx:+.3}, {gy:+.3}, {gz:+.3}] {attitude}",
+                    sample.timestamp_ns,
+                    sample.counter,
                 );
             }
-            for key in keys {
-                match key.key_type {
-                    parser::ProximityKeyType::Irk => {
-                        if key.data.len() == 16 {
-                            let mut arr = [0u8; 16];
-                            arr.copy_from_slice(&key.data);
-                            state.magic_acc_irk = Some(arr);
-                        }
-                    }
-                    parser::ProximityKeyType::EncKey => {
-                        if key.data.len() == 16 {
-                            let mut arr = [0u8; 16];
-                            arr.copy_from_slice(&key.data);
-                            state.magic_acc_enc_key = Some(arr);
-                        }
-                    }
-                }
-            }
-        }
-
-        parser::ParsedPacket::MagicCloudKeys { irk, enc_key } => {
-            log::info!("Magic cloud keys received (IRK + EncKey)");
-            state.magic_acc_irk = Some(irk);
-            state.magic_acc_enc_key = Some(enc_key);
-        }
-
-        parser::ParsedPacket::HandshakeAck | parser::ParsedPacket::FeaturesAck => {
-            log::debug!("Late handshake/features ACK (ignored)");
-        }
-
-        parser::ParsedPacket::Unknown(data) => {
-            log::debug!(
-                "Unknown packet ({} bytes): {}",
-                data.len(),
-                data.iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
         }
     }
+    log::debug!("IMU raw AAP packet ({} bytes): {:02X?}", data.len(), data);
 }
